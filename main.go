@@ -8,7 +8,10 @@ import (
 
 func main() {
 	db := config.ConnectDB()
-	db.AutoMigrate(&models.Task{})
+	db.AutoMigrate(
+		&models.Task{},
+		&models.User{},
+	)
 	r := routes.SetupRouter(db)
 	r.Run(":8000")
 }
