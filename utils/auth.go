@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"os"
 	"taskmanager/constants"
 	"taskmanager/models"
 	"time"
@@ -10,7 +11,12 @@ import (
 	"gorm.io/gorm"
 )
 
-var jwtSecret = []byte("supersecretkey")
+var jwtSecret = []byte(func() string {
+	if secret := os.Getenv("JWT_SECRET"); secret != "" {
+		return secret
+	}
+	return "supersecretkey"
+}())
 
 func HashPassword(password string) (string, error) {
 	bytes, err := bcrypt.GenerateFromPassword(
@@ -43,6 +49,22 @@ func GenerateJWT(user models.User) (string, error) {
 	return token.SignedString(jwtSecret)
 }
 
+func GetRecursiveReportIDs(managerID uint, db *gorm.DB) []uint {
+	var reportIDs []uint
+	var users []models.User
+
+	// Find direct reports
+	db.Where("manager_id = ?", managerID).Find(&users)
+
+	for _, user := range users {
+		reportIDs = append(reportIDs, user.ID)
+		// Recursively find reports of reports
+		reportIDs = append(reportIDs, GetRecursiveReportIDs(user.ID, db)...)
+	}
+
+	return reportIDs
+}
+
 func CanAccessTask(
 	task models.Task,
 	userID uint,
@@ -61,19 +83,16 @@ func CanAccessTask(
 
 	if role == constants.RoleManager {
 
-		if task.CreatedByID == userID {
+		if task.CreatedByID == userID || task.AssignedToID == userID {
 			return true
 		}
 
-		var member models.User
-		err := db.
-			Where("id = ? AND manager_id = ?",
-				task.AssignedToID,
-				userID,
-			).
-			First(&member).Error
-
-		return err == nil
+		reportIDs := GetRecursiveReportIDs(userID, db)
+		for _, reportID := range reportIDs {
+			if task.CreatedByID == reportID || task.AssignedToID == reportID {
+				return true
+			}
+		}
 	}
 
 	return false
@@ -85,6 +104,10 @@ func CanAssignTask(
 	assigneeID uint,
 	db *gorm.DB,
 ) (bool, error) {
+	if assigneeID == 0 {
+		return assignerRole == constants.RoleAdmin || assignerRole == constants.RoleManager, nil
+	}
+
 	// Admin can assign to anyone
 	if assignerRole == constants.RoleAdmin {
 		return true, nil
@@ -102,11 +125,19 @@ func CanAssignTask(
 	}
 
 	if assignerRole == constants.RoleManager {
-		// Manager can assign to their direct reports OR themselves
+		// Manager can assign to themselves
 		if assignerID == assigneeID {
 			return true, nil
 		}
-		return assignee.ManagerID != nil && *assignee.ManagerID == assignerID, nil
+
+		// Or to anyone in their recursive hierarchy
+		reportIDs := GetRecursiveReportIDs(assignerID, db)
+		for _, reportID := range reportIDs {
+			if assigneeID == reportID {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
 
 	if assignerRole == constants.RoleMember {
