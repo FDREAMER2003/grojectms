@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"taskmanager/constants"
@@ -18,16 +19,27 @@ type TaskController struct {
 }
 
 type updateTaskInput struct {
-	Title              *string `json:"title"`
-	Description        *string `json:"description"`
-	AssignedToID       *uint   `json:"assigned_to_id"`
-	Status             *string `json:"status"`
-	ProgressPercentage *int    `json:"progress_percentage"`
+	Title              *string    `json:"title"`
+	Description        *string    `json:"description"`
+	AssignedToID       *uint      `json:"assigned_to_id"`
+	Status             *string    `json:"status"`
+	ProgressPercentage *int       `json:"progress_percentage"`
+	Deadline           *time.Time `json:"deadline"`
 }
 
 type taskDecisionInput struct {
 	Comments string `json:"comments"`
 	Reason   string `json:"reason"`
+}
+
+type requestExtensionInput struct {
+	RequestedDeadline *time.Time `json:"requested_deadline"`
+	Reason            string     `json:"reason"`
+}
+
+type extendDeadlineInput struct {
+	NewDeadline *time.Time `json:"new_deadline"`
+	Comments    string     `json:"comments"`
 }
 
 func (tc *TaskController) CreateTask(c *gin.Context) {
@@ -64,6 +76,8 @@ func (tc *TaskController) CreateTask(c *gin.Context) {
 	} else {
 		task.Status = constants.TaskStatusAssigned
 	}
+
+	setDeadlineStatus(&task)
 
 	if err := tc.DB.Create(&task).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task"})
@@ -102,6 +116,13 @@ func (tc *TaskController) GetTasks(c *gin.Context) {
 		return
 	}
 
+	for i := range tasks {
+		if err := tc.refreshTaskDeadlineStatus(&tasks[i]); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to evaluate deadline status"})
+			return
+		}
+	}
+
 	c.JSON(http.StatusOK, tasks)
 }
 
@@ -118,6 +139,11 @@ func (tc *TaskController) GetTask(c *gin.Context) {
 
 	if !utils.CanAccessTask(task, userID, role, tc.DB) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Unauthorized access"})
+		return
+	}
+
+	if err := tc.refreshTaskDeadlineStatus(&task); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to evaluate deadline status"})
 		return
 	}
 
@@ -140,6 +166,11 @@ func (tc *TaskController) UpdateTask(c *gin.Context) {
 		return
 	}
 
+	if err := tc.refreshTaskDeadlineStatus(&task); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to evaluate deadline status"})
+		return
+	}
+
 	var input updateTaskInput
 	if err := c.BindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -151,7 +182,7 @@ func (tc *TaskController) UpdateTask(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Members can only update tasks assigned to themselves"})
 			return
 		}
-		if input.Title != nil || input.Description != nil || input.AssignedToID != nil {
+		if input.Title != nil || input.Description != nil || input.AssignedToID != nil || input.Deadline != nil {
 			c.JSON(http.StatusForbidden, gin.H{"error": "Members can only update progress and status on their own tasks"})
 			return
 		}
@@ -188,6 +219,14 @@ func (tc *TaskController) UpdateTask(c *gin.Context) {
 		if task.Status == constants.TaskStatusCreated && task.AssignedToID != 0 {
 			task.Status = constants.TaskStatusAssigned
 		}
+	}
+	if input.Deadline != nil {
+		task.Deadline = input.Deadline
+		task.ExtensionRequested = false
+		task.ExtensionRequestedByID = nil
+		task.ExtensionRequestedAt = nil
+		task.ExtensionRequestedDeadline = nil
+		task.ExtensionReason = ""
 	}
 
 	if input.Status != nil {
@@ -235,8 +274,161 @@ func (tc *TaskController) UpdateTask(c *gin.Context) {
 		}
 	}
 
+	setDeadlineStatus(&task)
+
 	if err := tc.DB.Save(&task).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update task"})
+		return
+	}
+
+	c.JSON(http.StatusOK, task)
+}
+
+func (tc *TaskController) RequestExtension(c *gin.Context) {
+	id := c.Param("id")
+	userID := uint(c.GetFloat64("user_id"))
+	role := c.GetString("role")
+
+	var task models.Task
+	if err := tc.DB.First(&task, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+
+	if !utils.CanAccessTask(task, userID, role, tc.DB) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Unauthorized access"})
+		return
+	}
+
+	if task.AssignedToID != userID || role != constants.RoleMember {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only assigned member can request extension"})
+		return
+	}
+
+	if err := tc.refreshTaskDeadlineStatus(&task); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to evaluate deadline status"})
+		return
+	}
+
+	if task.Deadline == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Task has no deadline"})
+		return
+	}
+	if task.DeadlineStatus != constants.DeadlineStatusOverdue {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Extension can only be requested for overdue tasks"})
+		return
+	}
+
+	var input requestExtensionInput
+	if err := c.BindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if input.RequestedDeadline == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "requested_deadline is required"})
+		return
+	}
+	if !input.RequestedDeadline.After(*task.Deadline) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "requested_deadline must be after current deadline"})
+		return
+	}
+
+	now := time.Now()
+	task.ExtensionRequested = true
+	task.ExtensionRequestedByID = &userID
+	task.ExtensionRequestedAt = &now
+	task.ExtensionRequestedDeadline = input.RequestedDeadline
+	task.ExtensionReason = input.Reason
+
+	if err := tc.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&task).Error; err != nil {
+			return err
+		}
+
+		audit := models.TaskAudit{
+			TaskID:   task.ID,
+			Action:   "extension_requested",
+			ActorID:  userID,
+			Comments: fmt.Sprintf("requested_deadline=%s; reason=%s", input.RequestedDeadline.Format(time.RFC3339), input.Reason),
+		}
+		return tx.Create(&audit).Error
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to request extension"})
+		return
+	}
+
+	c.JSON(http.StatusOK, task)
+}
+
+func (tc *TaskController) ExtendDeadline(c *gin.Context) {
+	id := c.Param("id")
+	userID := uint(c.GetFloat64("user_id"))
+	role := c.GetString("role")
+
+	var task models.Task
+	if err := tc.DB.First(&task, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+
+	if !utils.CanAccessTask(task, userID, role, tc.DB) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Unauthorized access"})
+		return
+	}
+
+	if role == constants.RoleMember {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Members cannot extend deadline"})
+		return
+	}
+
+	if userID != task.CreatedByID && role != constants.RoleAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Only task assigner or admin can extend deadline"})
+		return
+	}
+
+	var input extendDeadlineInput
+	if err := c.BindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if input.NewDeadline == nil {
+		input.NewDeadline = task.ExtensionRequestedDeadline
+	}
+	if input.NewDeadline == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "new_deadline is required"})
+		return
+	}
+	if task.Deadline != nil && !input.NewDeadline.After(*task.Deadline) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "new_deadline must be after current deadline"})
+		return
+	}
+
+	now := time.Now()
+	task.Deadline = input.NewDeadline
+	task.ExtensionRequested = false
+	task.ExtensionApprovedByID = &userID
+	task.ExtensionApprovedAt = &now
+	task.ExtensionRequestedByID = nil
+	task.ExtensionRequestedAt = nil
+	task.ExtensionRequestedDeadline = nil
+	task.ExtensionReason = ""
+	setDeadlineStatus(&task)
+
+	if err := tc.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&task).Error; err != nil {
+			return err
+		}
+
+		audit := models.TaskAudit{
+			TaskID:   task.ID,
+			Action:   "deadline_extended",
+			ActorID:  userID,
+			Comments: fmt.Sprintf("new_deadline=%s; comments=%s", input.NewDeadline.Format(time.RFC3339), input.Comments),
+		}
+		return tx.Create(&audit).Error
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to extend deadline"})
 		return
 	}
 
@@ -283,6 +475,7 @@ func (tc *TaskController) ApproveTask(c *gin.Context) {
 	if task.CompletedAt == nil {
 		task.CompletedAt = &now
 	}
+	setDeadlineStatus(&task)
 
 	if err := tc.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&task).Error; err != nil {
@@ -349,6 +542,7 @@ func (tc *TaskController) RejectTask(c *gin.Context) {
 	task.CompletionLocked = false
 	task.ApprovedByID = nil
 	task.ApprovedAt = nil
+	setDeadlineStatus(&task)
 
 	if err := tc.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&task).Error; err != nil {
@@ -435,4 +629,25 @@ func isAllowedStatusTransition(from, to string) bool {
 	default:
 		return false
 	}
+}
+
+func (tc *TaskController) refreshTaskDeadlineStatus(task *models.Task) error {
+	previous := task.DeadlineStatus
+	setDeadlineStatus(task)
+	if previous == task.DeadlineStatus {
+		return nil
+	}
+	return tc.DB.Model(task).Update("deadline_status", task.DeadlineStatus).Error
+}
+
+func setDeadlineStatus(task *models.Task) {
+	if task.Deadline == nil {
+		task.DeadlineStatus = constants.DeadlineStatusOnTime
+		return
+	}
+	if time.Now().After(*task.Deadline) {
+		task.DeadlineStatus = constants.DeadlineStatusOverdue
+		return
+	}
+	task.DeadlineStatus = constants.DeadlineStatusOnTime
 }

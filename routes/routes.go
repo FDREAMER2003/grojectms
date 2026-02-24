@@ -21,6 +21,8 @@ func SetupRouter(db *gorm.DB) *gin.Engine {
 		taskRoutes.GET("", taskController.GetTasks)
 		taskRoutes.GET("/:id", taskController.GetTask)
 		taskRoutes.PUT("/:id", taskController.UpdateTask)
+		taskRoutes.POST("/:id/request-extension", middleware.RoleMiddleware(constants.RoleMember), taskController.RequestExtension)
+		taskRoutes.POST("/:id/extend-deadline", middleware.RoleMiddleware(constants.RoleAdmin, constants.RoleManager), taskController.ExtendDeadline)
 		taskRoutes.POST("/:id/approve", middleware.RoleMiddleware(constants.RoleAdmin, constants.RoleManager), taskController.ApproveTask)
 		taskRoutes.POST("/:id/reject", middleware.RoleMiddleware(constants.RoleAdmin, constants.RoleManager), taskController.RejectTask)
 		taskRoutes.DELETE("/:id", middleware.RoleMiddleware(constants.RoleAdmin), taskController.DeleteTask)
